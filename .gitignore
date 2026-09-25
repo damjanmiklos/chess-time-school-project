@@ -1,0 +1,9 @@
+rawdata/
+data/
+scratch/
+engines/
+checkpoints/
+runs/
+__pycache__/
+*.pyc
+*.pyo
