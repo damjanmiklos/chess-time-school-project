@@ -1,7 +1,7 @@
 ---
 alwaysApply: true
 
-For this project you get a small exemption from not being allowed to touch the rawdata folder, here you can change them to make the stockfish eval work as described. And use the maia3 conda environment for this project.
+For this project you get a small exemption from not being allowed to touch the rawdata folder, here you can change them to make the stockfish eval work as described. And use the maia3 conda environment for this project. This is a school project, so the code that you write should be very compact and very easy to understand for me.
 ---
 
 

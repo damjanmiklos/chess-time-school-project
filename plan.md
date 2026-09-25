@@ -11,7 +11,7 @@ Predict P(win, draw, loss) from the side to move's perspective. The model gets e
 - Both players' remaining clock time
 - The time control's base time (games have different base times, so remaining clock alone is ambiguous)
 - The Stockfish W/D/L evaluation of the position
-- **This is a school project, so the code that you write should be very compact and very easy to understand for me.** (Of course in the scratch folder you can write as complicated temporary code as you want, I don't care about that.)
+- **** (Of course in the scratch folder you can write as complicated temporary code as you want, I don't care about that.)
 
 Nothing else. All games have no increment, so increment isn't an input.
 
