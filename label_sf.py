@@ -5,15 +5,17 @@ The same numbers replace any Lichess %eval inside that move's comment as [%sfwdl
 Positions are deduped by piece placement, side to move, castling and en passant.
 """
 import argparse, io, os, re, shutil, sqlite3, subprocess
+import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import Pool
 from pathlib import Path
 
 import chess, chess.pgn, pyarrow as pa, pyarrow.parquet as pq
+from tqdm import tqdm
 
 from config import BENCH_NODES, ENGINE, RAW
 
 EVAL = re.compile(r"\[%eval [^]]*\]\s*")
+HASH = 1             # smallest table; the sample's worst gap vs Hash 16 was 13 per mille
 BATCH = 256          # positions per worker trip; each one is still its own 10k-node search
 _ENGINE = None
 
@@ -37,14 +39,14 @@ def _read_until(proc, marker):
 
 def _boot(exe):
     proc = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, bufsize=0)
+                            stderr=subprocess.DEVNULL, bufsize=0, creationflags=0x08000000)
     def send(text):
         proc.stdin.write(text.encode()); proc.stdin.flush()
     proc.send = send
     proc.leftover = b""
     send("uci\n")
     _read_until(proc, b"uciok")
-    send("setoption name Threads value 1\nsetoption name Hash value 16\n"
+    send(f"setoption name Threads value 1\nsetoption name Hash value {HASH}\n"
          "setoption name UCI_ShowWDL value true\nisready\n")
     _read_until(proc, b"readyok")
     return proc
@@ -65,8 +67,8 @@ def _through_bestmove(proc):
         buf += chunk
 
 def _ask(proc, fen):
-    """One fresh 10k-node search. Commands go out in one write; WDL is the last unbound info line."""
-    proc.send(f"ucinewgame\nisready\nposition fen {fen}\ngo nodes 10000\n")
+    """One fresh 10k-node search. ucinewgame finishes before the next command is read."""
+    proc.send(f"ucinewgame\nposition fen {fen}\ngo nodes 10000\n")
     wdl = None
     for line in _through_bestmove(proc).splitlines():
         if b" wdl " not in line or b"lowerbound" in line or b"upperbound" in line:
@@ -110,8 +112,9 @@ def stamp(movetext, ply_wdl, n_moves):
         return body[:-1] + f" [%sfwdl {wdl[0]},{wdl[1]},{wdl[2]}]" + "}"
     return re.sub(r"\{[^}]*\}", repl, movetext)
 
-def cache_open():
-    path = RAW.parent / "sf_cache.sqlite"
+def cache_open(path=None):
+    path = Path(path) if path else RAW.parent / "sf_cache.sqlite"
+    path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path, timeout=120)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("CREATE TABLE IF NOT EXISTS pos (epd TEXT PRIMARY KEY, w INT, d INT, l INT)")
@@ -133,25 +136,25 @@ def store(con, rows):
 def parse_games(games):
     return [parse_game(g["movetext"], g["plies"]) for g in games]
 
-def search_missing(pool, con, known, missing):
-    fresh, done, mark = [], 0, 0
+def search_missing(pool, con, known, missing, desc=None):
+    fresh = []
     if not missing:
+        if desc:
+            tqdm.write(f"{desc}: cached")
         return
-    print(f"  evaluating {len(missing):,} new positions ({len(known):,} cached)", flush=True)
     batches = [missing[i:i + BATCH] for i in range(0, len(missing), BATCH)]
-    for rows in pool.imap_unordered(_eval_many, batches):
-        for epd, wdl in rows:
-            done += 1
-            if wdl is None:
-                continue
-            known[epd] = wdl
-            fresh.append((epd, *wdl))
-            if len(fresh) >= 4000:
-                store(con, fresh); fresh.clear()
-        step = done // 2000
-        if step > mark:
-            mark = step
-            print(f"  {done:,}/{len(missing):,}", flush=True)
+    with tqdm(total=len(missing), desc=desc, unit="pos", unit_scale=True, mininterval=1) as bar:
+        for rows in pool.imap_unordered(_eval_many, batches):
+            n = 0
+            for epd, wdl in rows:
+                n += 1
+                if wdl is None:
+                    continue
+                known[epd] = wdl
+                fresh.append((epd, *wdl))
+                if len(fresh) >= 4000:
+                    store(con, fresh); fresh.clear()
+            bar.update(n)
     if fresh:
         store(con, fresh)
 
@@ -178,6 +181,23 @@ def label_games(games, pool, con, parsed=None):
     search_missing(pool, con, known, missing)
     return (*columns_for(games, parsed, known), len(missing))
 
+def prepare_group(path, index, cache_path):
+    """Read, parse and cache-lookup one row group. Runs while the previous group is searched."""
+    table = pq.ParquetFile(path).read_row_group(index)
+    games = table.to_pylist()
+    parsed = parse_games(games)
+    need = list(dict.fromkeys(epd for epds, _ in parsed for epd in epds.values()))
+    reader = sqlite3.connect(cache_path, timeout=120)
+    reader.execute("PRAGMA query_only = ON")
+    known = lookup(reader, need)
+    reader.close()
+    missing = [epd for epd in need if epd not in known]
+    return table, games, parsed, known, missing
+
+def write_group(table, games, parsed, known, dest):
+    cols = columns_for(games, parsed, known)
+    pq.write_table(attach(table, *cols[:5]), dest, compression="zstd")
+
 def attach(table, movetexts, sf_w, sf_d, sf_l, has_sf):
     keep = [n for n in table.schema.names if n not in ("sf_w", "sf_d", "sf_l", "has_sf")]
     table = table.select(keep)
@@ -189,7 +209,7 @@ def attach(table, movetexts, sf_w, sf_d, sf_l, has_sf):
     table = table.append_column("has_sf", pa.array(has_sf, pa.list_(pa.bool_())))
     return table
 
-def label_file(path, pool, con, games=0, out=None):
+def label_file(path, pool, con, games=0, out=None, cache_path=None):
     path = Path(path)
     if games:
         table = pq.ParquetFile(path).read_row_group(0).slice(0, games)
@@ -203,33 +223,29 @@ def label_file(path, pool, con, games=0, out=None):
     if "has_sf" in pq.read_schema(path).names:
         print(f"skip {path.name}: already labeled", flush=True)
         return
+    cache_path = str(cache_path or (RAW.parent / "sf_cache.sqlite"))
     parts = path.parent / f"{path.stem}_sfparts"
     parts.mkdir(exist_ok=True)
-    pf = pq.ParquetFile(path)
-    pending = [(i, parts / f"{i:04d}.parquet") for i in range(pf.num_row_groups)
+    n_groups = pq.ParquetFile(path).metadata.num_row_groups
+    pending = [(i, parts / f"{i:04d}.parquet") for i in range(n_groups)
                if not (parts / f"{i:04d}.parquet").exists()]
-    # Parse the next row group, and write the previous one, while the engines search.
-    with ThreadPoolExecutor(max_workers=2) as bg:
-        def arm(i):
-            table = pf.read_row_group(i)
-            games = table.to_pylist()
-            return table, games, bg.submit(parse_games, games)
-        writing = None
-        current = arm(pending[0][0]) if pending else None
-        for n, (i, dest) in enumerate(pending):
-            table, games, parsed_fut = current
-            nxt = arm(pending[n + 1][0]) if n + 1 < len(pending) else None
-            cols = label_games(games, pool, con, parsed=parsed_fut.result())
-            if writing:
-                writing.result()
-            writing = bg.submit(pq.write_table, attach(table, *cols[:5]), dest, compression="zstd")
-            print(f"{path.name} group {i + 1}/{pf.num_row_groups}: {table.num_rows} games, "
-                  f"{cols[5]} new positions", flush=True)
-            current = nxt
-        if writing:
-            writing.result()
+    # The prep thread reads and parses the next group while every engine stays on the current one.
+    with ThreadPoolExecutor(max_workers=1) as prep, ThreadPoolExecutor(max_workers=1) as writer:
+        nxt = 0
+        prep_fut = prep.submit(prepare_group, str(path), pending[0][0], cache_path) if pending else None
+        writes = []
+        while prep_fut is not None:
+            index, dest = pending[nxt]
+            table, games, parsed, known, missing = prep_fut.result()
+            nxt += 1
+            prep_fut = (prep.submit(prepare_group, str(path), pending[nxt][0], cache_path)
+                        if nxt < len(pending) else None)
+            search_missing(pool, con, known, missing, f"{path.name} {index + 1}/{n_groups}")
+            writes.append(writer.submit(write_group, table, games, parsed, known, dest))
+        for job in writes:
+            job.result()
     done = sorted(parts.glob("*.parquet"))
-    if len(done) != pf.num_row_groups:
+    if len(done) != n_groups:
         raise SystemExit(f"{path.name} incomplete ({len(done)}/{pf.num_row_groups})")
     tmp = path.with_suffix(".parquet.stitch")
     writer = None
@@ -245,7 +261,7 @@ def label_file(path, pool, con, games=0, out=None):
 
 def main():
     ap = argparse.ArgumentParser(description="Add Stockfish W/D/L columns to the filtered months.")
-    ap.add_argument("--workers", type=int, default=26)
+    ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--month", default=None, help="only this YYYY-MM")
     ap.add_argument("--games", type=int, default=0, help="label this many games into --out and stop")
     ap.add_argument("--out", default="scratch/sf_sample.parquet")
@@ -260,7 +276,7 @@ def main():
     if not files:
         raise SystemExit("no month files")
     con = cache_open()
-    with Pool(args.workers, _init, (args.engine,)) as pool:
+    with mp.Pool(args.workers, _init, (args.engine,)) as pool:
         if args.games:
             label_file(files[0], pool, con, games=args.games, out=args.out)
             return
